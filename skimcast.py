@@ -17,7 +17,7 @@ screenshots are also laid out as one 3x3 overview grid.
 
 Writes NNN_MMmSS.Ss.png files, grid_*.png files and index.md to DIR (default: VIDEO_skimcast next to the
 video) and prints one line per screenshot."""
-import argparse, json, subprocess, sys
+import argparse, html, json, math, subprocess, sys
 from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -80,44 +80,69 @@ def mouse_step(a, b):
 
 
 def pick(video, height, threshold):
-    """Return [(time, frame, changed_pixels_vs_previous_pick, why)]."""
+    """Return the picks [(time, frame, changed_pixels_vs_previous_pick, why)], how much each
+    sample changed [(time, percent of the screen, mouse moved)], and a log of every decision
+    [(time, text)] for the report."""
+    percent = lambda pixels: 100 * pixels / (WIDTH * height)
     picks, previous, change_started, still_since, trail = [], None, None, 0.0, []
+    series, log, rest_judged = [], [], True
     for t, frame in samples(video, height):
         if not picks:
             picks.append((t, frame, None, "start of recording"))
+            series.append((t, 0.0, False))
+            log.append((t, "Kept: start of recording."))
             previous = frame
             continue
         step = mouse_step(frame, previous)
+        series.append((t, percent(changed(frame, previous)), bool(step)))
         if step is not None:
-            still_since = t
+            still_since, rest_judged = t, False
             trail.append(step)
         since_pick = changed(frame, picks[-1][1])
         if since_pick >= threshold:
             change_started = t if change_started is None else change_started
             settled = changed(frame, previous) < threshold
             if settled or t - change_started >= BURST_SECONDS:
-                picks.append((t, frame, since_pick, "screen changed"))
-                change_started, trail = None if settled else t, []
+                why = "screen changed" if settled else "screen still changing"
+                picks.append((t, frame, since_pick, why))
+                log.append((t, f"Kept: {percent(since_pick):.1f}% of the screen differs from the last screenshot, "
+                               + ("and it was already still." if settled and t == change_started
+                                  else f"and it settled after {t - change_started:.1f} s." if settled
+                                  else f"and it was still changing after {BURST_SECONDS:g} s.")))
+                change_started, trail, rest_judged = None if settled else t, [], True
         else:
             change_started = None
-            # The mouse rested, its last step was the cursor (not the mouse leaving the screen
-            # while something else flickered) and it travelled far enough to mean something.
-            path = [step for step in trail if step]
-            travelled = np.ptp(path, axis=0).max() if path else 0
-            if t - still_since >= MOUSE_REST_SECONDS and trail and trail[-1] and travelled >= MOUSE_TRAVEL * WIDTH:
-                picks.append((t, frame, since_pick, f"mouse stopped here for {MOUSE_REST_SECONDS:g} s"))
-                trail = []
+            if t - still_since >= MOUSE_REST_SECONDS and trail and not rest_judged:
+                # The mouse rested, its last step was the cursor (not the mouse leaving the screen
+                # while something else flickered) and it travelled far enough to mean something.
+                rest_judged = True
+                path = [step for step in trail if step]
+                travelled = np.ptp(path, axis=0).max() / WIDTH if path else 0
+                if not trail[-1]:
+                    log.append((t, "Not kept: movement stopped, but the last change was bigger than a cursor, "
+                                   "so it may be the mouse leaving the screen."))
+                elif travelled < MOUSE_TRAVEL:
+                    log.append((t, f"Not kept: the mouse stopped after moving {100 * travelled:.1f}% of the screen "
+                                   f"width since the last screenshot; it must move {100 * MOUSE_TRAVEL:g}%."))
+                else:
+                    picks.append((t, frame, since_pick, f"mouse stopped here for {MOUSE_REST_SECONDS:g} s"))
+                    log.append((t, f"Kept: the mouse moved {100 * travelled:.0f}% of the screen width and "
+                                   f"stopped for {MOUSE_REST_SECONDS:g} s."))
+                    trail = []
         previous = frame
     if change_started is not None:          # still changing when the recording ended
         picks.append((t, frame, changed(frame, picks[-1][1]), "screen still changing at the end"))
-    return picks
+        log.append((t, "Kept: the screen was still changing when the recording ended."))
+    return picks, series, log
 
 
-def thin(picks, limit):
+def thin(picks, limit, log):
     """Drop the picks that differ least from the one before until `limit` remain."""
     picks = list(picks)
     while len(picks) > limit:
         drop = min(range(1, len(picks)), key=lambda i: picks[i][2])
+        log.append((picks[drop][0], f"Dropped to keep at most {limit} screenshots: it was the most like the "
+                                    "screenshot before it."))
         del picks[drop]
         if drop < len(picks):
             t, frame, _, why = picks[drop]
@@ -162,6 +187,95 @@ def save_grids(cells, out):
     return names
 
 
+REPORT_STYLE = """
+:root { --ink: #1f2328; --soft: #59636e; --line: #d1d9e0; --paper: #ffffff; --bar: #8c959f;
+        --mark: #1f2328; --mouse: #d97706; --limit: #cf222e; }
+@media (prefers-color-scheme: dark) {
+  :root { --ink: #e6edf3; --soft: #9198a1; --line: #3d444d; --paper: #0d1117; --bar: #656c76;
+          --mark: #e6edf3; --mouse: #f0883e; --limit: #f85149; } }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.5 system-ui, sans-serif; }
+main { max-width: 1200px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 { font-size: 24px; margin: 0 0 8px; } h2 { font-size: 18px; margin: 40px 0 12px; }
+p { margin: 0 0 8px; } .soft { color: var(--soft); font-size: 14px; }
+a { color: inherit; }
+.chart { display: grid; grid-template-columns: 56px 1fr; margin-top: 16px; }
+.ylabels { position: relative; height: 180px; margin-top: 48px; font-size: 12px; color: var(--soft); }
+.ylabels span { position: absolute; right: 8px; transform: translateY(-50%); }
+.marks { position: relative; height: 48px; font-size: 13px; }
+.marks a { position: absolute; transform: translateX(-50%); text-decoration: none; font-weight: 600; }
+.marks a.low { top: 24px; }
+.plot svg { display: block; width: 100%; border: 1px solid var(--line); }
+.area { height: 180px; } .mouse { height: 16px; margin-top: 4px; }
+.xlabels { position: relative; height: 24px; font-size: 12px; color: var(--soft); }
+.xlabels span { position: absolute; top: 4px; transform: translateX(-50%); }
+.shots { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+.shot { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.shot img { display: block; width: 100%; border-bottom: 1px solid var(--line); }
+.shot p { margin: 8px 12px; font-size: 14px; } .shot b { font-size: 16px; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+td { padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+td:first-child { white-space: nowrap; font-variant-numeric: tabular-nums; width: 1%; }
+"""
+
+
+def write_report(path, video, duration, size, settings, series, log, shots, grids):
+    """A page for people: what was looked at, what was kept, and why."""
+    esc, span = html.escape, max(duration, 1e-6)
+    x = lambda t: 100 * t / span
+
+    def y(percent):  # log scale, 0.01% of the screen at the bottom and 100% at the top
+        return 100 - 100 * (math.log10(min(max(percent, 0.01), 100)) + 2) / 4
+
+    bars = "".join(f"M{x(t):.3f} 100V{y(p):.2f}" for t, p, _ in series if p > 0)
+    mouse = "".join(f"M{x(t):.3f} 0V100" for t, _, moved in series if moved)
+    kept = "".join(f"M{x(t):.3f} 0V100" for t, *_ in shots)
+    stroke = 'fill="none" vector-effect="non-scaling-stroke"'
+    area = (f'<svg class="area" viewBox="0 0 100 100" preserveAspectRatio="none">'
+            f'<path d="{bars}" stroke="var(--bar)" stroke-width="1" {stroke}/>'
+            f'<path d="{kept}" stroke="var(--mark)" stroke-width="1.5" {stroke}/>'
+            f'<path d="M0 {y(settings["min_change"]):.2f}H100" stroke="var(--limit)" stroke-width="1" '
+            f'stroke-dasharray="4 4" {stroke}/></svg>')
+    strip = (f'<svg class="mouse" viewBox="0 0 100 100" preserveAspectRatio="none">'
+             f'<path d="{mouse}" stroke="var(--mouse)" stroke-width="1" {stroke}/></svg>')
+    marks = "".join(f'<a href="#shot-{n}" class="{"low" if n % 2 == 0 else ""}" style="left:{x(t):.3f}%" '
+                    f'title="{n}: {clock(t)}, {esc(why)}">{n}</a>' for n, (t, _, why) in enumerate(shots, 1))
+    step = next(s for s in (1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600) if span / s <= 10)
+    ticks = "".join(f'<span style="left:{x(t):.3f}%">{clock(t)[:-2]}</span>'
+                    for t in range(0, int(span) + 1, step))
+    ylabels = "".join(f'<span style="top:{y(p):.1f}%">{p:g}%</span>' for p in (100, 10, 1, 0.1, 0.01))
+    cards = "".join(f'<div class="shot" id="shot-{n}"><a href="{esc(name)}"><img src="{esc(name)}" loading="lazy" '
+                    f'alt="Screenshot {n} at {clock(t)}"></a><p><b>{n}</b> &nbsp; {clock(t)}<br>'
+                    f'{esc(why[0].upper() + why[1:])}.</p></div>' for n, (t, name, why) in enumerate(shots, 1))
+    number = {t: n for n, (t, *_) in enumerate(shots, 1)}
+    rows = "".join(f'<tr><td>{clock(t)}</td><td>'
+                   + (f'<a href="#shot-{number[t]}">Screenshot {number[t]}</a>. ' if t in number and text.startswith("Kept") else "")
+                   + f'{esc(text)}</td></tr>' for t, text in sorted(log, key=lambda entry: entry[0]))
+    grid_links = ", ".join(f'<a href="{esc(g)}">{esc(g)}</a>' for g in grids)
+    page = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>skimcast: {esc(video)}</title><style>{REPORT_STYLE}</style></head><body><main>
+<h1>{esc(video)}</h1>
+<p>skimcast looked at {len(series)} moments of this {clock(duration)} recording ({SAMPLE_FPS} per second,
+{size}) and kept {len(shots)} screenshots.</p>
+<p class="soft">It keeps a moment when at least {settings["min_change"]:g}% of the screen changed and then settled,
+one every {BURST_SECONDS:g} s while the screen keeps changing, and one when the mouse moves at least
+{100 * MOUSE_TRAVEL:g}% of the screen width and stops for {MOUSE_REST_SECONDS:g} s. At most {settings["max"]}.</p>
+<h2>What it looked at</h2>
+<p class="soft">Grey bars: how much of the screen changed since the moment before (log scale). Red dashed line:
+the {settings["min_change"]:g}% needed to count as a change. Dark lines and numbers: screenshots kept. Orange strip
+below: the mouse moving.</p>
+<div class="chart"><div class="ylabels">{ylabels}</div>
+<div class="plot"><div class="marks">{marks}</div>{area}{strip}<div class="xlabels">{ticks}</div></div></div>
+<h2>Screenshots kept</h2>
+<p class="soft">The agent gets these, and the same ones laid out in overview grids: {grid_links}.</p>
+<div class="shots">{cards}</div>
+<h2>Decision log</h2>
+<table>{rows}</table>
+</main></body></html>
+"""
+    path.write_text(page)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("video")
@@ -175,7 +289,8 @@ def main():
     width, height, duration, has_sound = probe(str(video))
     small_height = round(height * WIDTH / width / 2) * 2
     threshold = max(1, int(WIDTH * small_height * args.min_change / 100))
-    picks = thin(pick(str(video), small_height, threshold), max(1, args.max))
+    picks, series, log = pick(str(video), small_height, threshold)
+    picks = thin(picks, max(1, args.max), log)
 
     out = Path(args.out).expanduser().resolve() if args.out else video.with_name(video.stem + "_skimcast")
     out.mkdir(parents=True, exist_ok=True)
@@ -186,8 +301,9 @@ def main():
         name = f"{number:03d}_{int(t // 60):02d}m{t % 60:04.1f}s.png"
         label = f"{clock(t)} since recording start   (of {clock(duration)})   screenshot {number} of {len(picks)}"
         cells.append(labelled(save(str(video), t, width, height, label, out / name), f"{number}   {clock(t)}", 30))
-        if why == "screen changed":
-            why = f"{100 * pixels / (WIDTH * small_height):.1f}% of the screen changed"
+        if why.startswith("screen "):
+            why = f"{100 * pixels / (WIDTH * small_height):.1f}% of the screen changed" + (
+                ", and it was still changing" if why.endswith("changing") else "")
         shots.append((t, name, why))
         print(f"{clock(t)}  {out / name}  ({why})")
 
@@ -206,8 +322,10 @@ def main():
     for t, name, why in shots:
         lines += ["", f"## {clock(t)}  {name}", "", why[0].upper() + why[1:] + "."]
     (out / "index.md").write_text("\n".join(lines) + "\n")
+    write_report(out / "report.html", video.name, duration, f"{width}x{height}",
+                 {"min_change": args.min_change, "max": max(1, args.max)}, series, log, shots, grids)
     print(f"\n{len(picks)} screenshots and {len(grids)} overview grid{'s' * (len(grids) != 1)} from {clock(duration)} of video. "
-          f"Index: {out / 'index.md'}")
+          f"Index: {out / 'index.md'}\nReport for people: {out / 'report.html'}")
 
 
 if __name__ == "__main__":

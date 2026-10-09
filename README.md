@@ -29,6 +29,7 @@ shortened):
 overview  wikipedia-demo_skimcast/grid_01_001-009.png
 
 9 screenshots and 1 overview grid from 00:20.3 of video. Index: wikipedia-demo_skimcast/index.md
+Report for people: wikipedia-demo_skimcast/report.html
 ```
 
 The overview grid from that run:
@@ -46,6 +47,10 @@ Everything goes to `<video>_skimcast/` next to the video, or to `--out DIR`.
   its unused slots empty.
 - `index.md`: the list of screenshots and why each was kept, written for the
   agent to read first.
+- `report.html`: a page for you, to check what the agent was given. It shows
+  every moment skimcast looked at on a timeline (how much the screen changed,
+  when the mouse moved), which moments it kept, and a log of each decision,
+  including mouse stops it chose not to keep and why.
 
 An agent can read the grids to see the whole recording, then open single
 screenshots where it needs to read text.

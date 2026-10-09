@@ -37,6 +37,9 @@ to the video.
   while it keeps changing, and when the mouse travels somewhere and stops for
   1.5 seconds. A resting mouse usually points at what the user means.
 
+- Give the user the path of `report.html`. It shows them what skimcast looked
+  at and why it kept each screenshot, so they can check what you were given.
+
 - When the user describes a moment ("when I clicked Save", "at the end"),
   match it to a screenshot rather than guessing.
 
