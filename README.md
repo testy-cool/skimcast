@@ -41,7 +41,8 @@ The overview grid from that run:
 Everything goes to `<video>_skimcast/` next to the video, or to `--out DIR`.
 
 - `001_00m00.0s.png` and on: full-size screenshots with a black band on top
-  that says how far into the recording each was taken.
+  that says how far into the recording each was taken. When only a little
+  changed since the screenshot before, a magenta box marks it.
 - `grid_01_001-009.png` and on: nine consecutive screenshots in a 3x3 grid,
   2000 px wide, each labelled with its number and time. The last grid leaves
   its unused slots empty.
@@ -64,6 +65,12 @@ screenshots where it needs to read text.
   for 1.5 seconds, that moment is kept, because a resting mouse usually points
   at something. Changes in the top and bottom 4% of the screen, where panel
   clocks and tray icons live, do not count as mouse movement.
+- When less than 2% of the screen changed since the screenshot before, a
+  magenta box goes around each changed area, because a small change is easy
+  to miss, especially in a grid. Bigger changes are not boxed, since they are
+  plain to see and boxes would be noise. Neither are the cursor, thin slivers
+  such as a title bar changing shade, or changes scattered over more than five
+  places.
 - When there are more than `--max` frames (default 40), the ones most like the
   frame before them are dropped first.
 

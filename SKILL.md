@@ -33,6 +33,9 @@ to the video.
 - The band on top of each screenshot says how far into the recording it was
   taken. Use those times when you report what you saw.
 
+- A magenta box on a screenshot marks a small change since the screenshot
+  before, such as a menu opening or a list scrolling. Look there first.
+
 - A screenshot is kept when the screen changed and settled, every 2 seconds
   while it keeps changing, and when the mouse travels somewhere and stops for
   1.5 seconds. A resting mouse usually points at what the user means.

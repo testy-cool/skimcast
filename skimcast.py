@@ -35,6 +35,11 @@ PANEL_EDGE = 0.04        # top and bottom share of the screen holding panels, cl
 GRID_SIDE = 3            # an overview grid holds GRID_SIDE x GRID_SIDE consecutive screenshots
 GRID_WIDTH = 2000        # the widest image Claude Code shows without shrinking it
 GRID_GAP = 8
+MARK_BELOW = 2.0         # box what changed when less than this percent of the screen changed
+MARK_MOST = 5            # more separate changed areas than this are scattered, and boxes would be noise
+MARK_CELL = 8            # changed pixels this close (analysis pixels) belong to one area
+CURSOR_SIZE = 40         # a changed area no bigger than this many screen pixels is the cursor
+MARK_COLOR = "#ff00ff"
 
 
 def clock(seconds):
@@ -150,6 +155,50 @@ def thin(picks, limit, log):
     return picks
 
 
+def changed_areas(a, b, width):
+    """Boxes (x0, y0, x1, y1), in analysis pixels, around what changed between two
+    screenshots, when the change is small enough to miss. Empty when it is big enough to
+    see anyway, or scattered over too many places. Panels and the cursor are left out."""
+    height = len(a)
+    edge = int(height * PANEL_EDGE)
+    mask = np.abs(a - b) > PIXEL_DELTA
+    mask[:edge], mask[height - edge:] = False, False
+    if not mask.any() or 100 * mask.mean() >= MARK_BELOW:
+        return []
+    rows, cols = height // MARK_CELL, WIDTH // MARK_CELL
+    cells = mask[:rows * MARK_CELL, :cols * MARK_CELL].reshape(rows, MARK_CELL, cols, MARK_CELL).any(axis=(1, 3))
+    seen, boxes, cursor = np.zeros_like(cells), [], CURSOR_SIZE * WIDTH / width
+    for start in zip(*np.nonzero(cells)):
+        if seen[start]:
+            continue
+        seen[start], stack, members = True, [start], []
+        while stack:                     # flood fill one area of touching cells
+            row, col = stack.pop()
+            members.append((row, col))
+            for near in ((row + dr, col + dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1)):
+                if 0 <= near[0] < rows and 0 <= near[1] < cols and cells[near] and not seen[near]:
+                    seen[near] = True
+                    stack.append(near)
+        member_rows, member_cols = zip(*members)
+        top, left = min(member_rows) * MARK_CELL, min(member_cols) * MARK_CELL
+        ys, xs = np.nonzero(mask[top:(max(member_rows) + 1) * MARK_CELL, left:(max(member_cols) + 1) * MARK_CELL])
+        box = (left + xs.min(), top + ys.min(), left + xs.max() + 1, top + ys.max() + 1)
+        # The cursor is small in both directions; a sliver one or two pixels thin is an edge or
+        # border changing shade, such as a window title bar when focus moves.
+        if max(box[2] - box[0], box[3] - box[1]) > cursor and min(box[2] - box[0], box[3] - box[1]) > 2:
+            boxes.append(box)
+    return boxes if len(boxes) <= MARK_MOST else []
+
+
+def draw_boxes(picture, boxes, line):
+    """Magenta rectangles just outside each box, which is in analysis pixels."""
+    scale, draw = picture.width / WIDTH, ImageDraw.Draw(picture)
+    for x0, y0, x1, y1 in boxes:
+        draw.rectangle((x0 * scale - 2 * line, y0 * scale - 2 * line, x1 * scale + 2 * line, y1 * scale + 2 * line),
+                       outline=MARK_COLOR, width=line)
+    return picture
+
+
 def labelled(picture, label, band):
     """The picture with a black band on top holding the label."""
     page = Image.new("RGB", (picture.width, picture.height + band), "black")
@@ -159,14 +208,16 @@ def labelled(picture, label, band):
     return page
 
 
-def save(video, t, width, height, label, path):
-    """Save the full-size screenshot and return a small copy for the overview grids."""
+def save(video, t, width, height, label, path, boxes):
+    """Save the full-size screenshot, with boxes around small changes, and return a small
+    copy for the overview grids."""
     raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{t:.3f}", "-i", video, "-frames:v", "1",
                           "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True, check=True).stdout
     shot = Image.frombytes("RGB", (width, height), raw[:width * height * 3])
-    labelled(shot, label, max(36, height // 30)).save(path, compress_level=3)
     cell = min(width, (GRID_WIDTH - GRID_GAP * (GRID_SIDE - 1)) // GRID_SIDE)
-    return shot.resize((cell, round(height * cell / width)), Image.LANCZOS)
+    small = draw_boxes(shot.resize((cell, round(height * cell / width)), Image.LANCZOS), boxes, 3)
+    labelled(draw_boxes(shot, boxes, max(3, width // 640)), label, max(36, height // 30)).save(path, compress_level=3)
+    return small
 
 
 def save_grids(cells, out):
@@ -259,7 +310,8 @@ def write_report(path, video, duration, size, settings, series, log, shots, grid
 {size}) and kept {len(shots)} screenshots.</p>
 <p class="soft">It keeps a moment when at least {settings["min_change"]:g}% of the screen changed and then settled,
 one every {BURST_SECONDS:g} s while the screen keeps changing, and one when the mouse moves at least
-{100 * MOUSE_TRAVEL:g}% of the screen width and stops for {MOUSE_REST_SECONDS:g} s. At most {settings["max"]}.</p>
+{100 * MOUSE_TRAVEL:g}% of the screen width and stops for {MOUSE_REST_SECONDS:g} s. At most {settings["max"]}.
+When less than {MARK_BELOW:g}% of the screen changed, a magenta box marks what changed.</p>
 <h2>What it looked at</h2>
 <p class="soft">Grey bars: how much of the screen changed since the moment before (log scale). Red dashed line:
 the {settings["min_change"]:g}% needed to count as a change. Dark lines and numbers: screenshots kept. Orange strip
@@ -297,13 +349,18 @@ def main():
     for old in [*out.glob("[0-9][0-9][0-9]_*.png"), *out.glob("grid_*.png")]:
         old.unlink()
     shots, cells = [], []
-    for number, (t, _, pixels, why) in enumerate(picks, 1):
+    for number, (t, frame, pixels, why) in enumerate(picks, 1):
         name = f"{number:03d}_{int(t // 60):02d}m{t % 60:04.1f}s.png"
+        boxes = changed_areas(picks[number - 2][1], frame, width) if number > 1 else []
         label = f"{clock(t)} since recording start   (of {clock(duration)})   screenshot {number} of {len(picks)}"
-        cells.append(labelled(save(str(video), t, width, height, label, out / name), f"{number}   {clock(t)}", 30))
+        if boxes:
+            label += "   magenta box: changed since the screenshot before"
+        cells.append(labelled(save(str(video), t, width, height, label, out / name, boxes), f"{number}   {clock(t)}", 30))
         if why.startswith("screen "):
             why = f"{100 * pixels / (WIDTH * small_height):.1f}% of the screen changed" + (
                 ", and it was still changing" if why.endswith("changing") else "")
+        if boxes:
+            why += f"; a magenta box marks {'where' if len(boxes) == 1 else f'the {len(boxes)} places'}"
         shots.append((t, name, why))
         print(f"{clock(t)}  {out / name}  ({why})")
 
@@ -315,7 +372,9 @@ def main():
     lines = [f"# {video.name}", "",
              f"Recording length {clock(duration)}, {width}x{height}. {len(picks)} screenshots, taken when the "
              f"screen changed and settled, or when the mouse stopped to point at something. The mouse cursor "
-             f"shows wherever it was on this screen. Times count from the start of the recording. {sound}".rstrip(),
+             f"shows wherever it was on this screen. When less than {MARK_BELOW:g}% of the screen changed, a "
+             f"magenta box marks what changed, so small changes are not missed. Times count from the start "
+             f"of the recording. {sound}".rstrip(),
              "", f"For an overview, read the grids first. Each holds {GRID_SIDE * GRID_SIDE} consecutive "
              f"screenshots, left to right then down, labelled with their number and time: {', '.join(grids)}. "
              f"Then open the single screenshots where you need detail."]
